@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react"; // FIX: 加 useEffect
 import {
   Input,
   Button,
@@ -30,26 +30,55 @@ function App() {
   const [results, setResults] = useState(null);
   const [loading, setLoading] = useState(false);
   const [selectedAction, setSelectedAction] = useState(null);
+  const [selectedIndex, setSelectedIndex] = useState(null); // FIX: 记录索引
+  const [maxSteps, setMaxSteps] = useState(""); // FIX: 移到组件内
   const socketRef = useRef(null);
 
+  // FIX: 组件卸载时关闭 socket
+  useEffect(() => {
+    return () => {
+      try {
+        socketRef.current?.close();
+      } catch {}
+    };
+  }, []);
+
+  // FIX: 动态计算 WS 地址（本地开发也能覆盖）
+  const wsBase = (() => {
+    const isLocal = location.hostname === "localhost" || location.hostname === "127.0.0.1";
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const host = isLocal ? "localhost:8000" : location.host;
+    return `${proto}://${host}`;
+  })();
+
+  const closeExistingSocket = () => {
+    try {
+      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        socketRef.current.close();
+      }
+    } catch {}
+  };
+
   const handleRun = () => {
+    closeExistingSocket(); // FIX
     setLogs([]);
     setLogText("");
     setResults(null);
     setLoading(true);
 
-    const socket = new WebSocket("ws://localhost:8000/ws/agent");
+    const socket = new WebSocket(`${wsBase}/ws/agent`); // FIX
     socketRef.current = socket;
 
     socket.onopen = () => {
-      socket.send(JSON.stringify({ url, instruction }));
+      const payload = { url, instruction, max_steps: maxSteps || 10 };
+      socket.send(JSON.stringify(payload));
     };
 
     socket.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
         if (data.type === "final_result") {
-          setResults(data.annotated_actions);
+          setResults(data.annotated_combined);
           setLoading(false);
           message.success("✅ Agent finished successfully");
         } else if (data.type === "agent_log_text") {
@@ -80,11 +109,12 @@ function App() {
       return;
     }
 
+    closeExistingSocket(); // FIX
     setLogs([]);
     setResults(null);
     setLoading(true);
 
-    const socket = new WebSocket("ws://localhost:8000/ws/analyze");
+    const socket = new WebSocket(`${wsBase}/ws/analyze`); // FIX
     socketRef.current = socket;
 
     socket.onopen = () => {
@@ -95,7 +125,7 @@ function App() {
       try {
         const data = JSON.parse(event.data);
         if (data.type === "final_result") {
-          setResults(data.annotated_actions);
+          setResults(data.annotated_combined);
           setLoading(false);
           message.success("✅ Analysis finished successfully");
         } else if (data.type === "error") {
@@ -125,7 +155,7 @@ function App() {
     });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "annotated_actions.json";
+    link.download = "annotated_combined.json";
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -137,52 +167,96 @@ function App() {
     const blob = new Blob([text], { type: "text/plain" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "agent_log.txt";
+    link.download = mode === "exploration" ? "agent_log.jsonl" : "uploaded_log.txt"; // FIX: 名称更贴切
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
+  const summarizeInteracted = (ie) => {
+    if (!ie) return "";
+    if (typeof ie === "string") return ie.slice(0, 120);
+    return (
+      ie?.attributes?.id ||
+      ie?.node_name ||
+      (typeof ie?.x_path === "string" ? ie.x_path.slice(0, 80) : "") ||
+      JSON.stringify(ie).slice(0, 120)
+    );
+  };
+
   const columns = [
-    { title: "ID", dataIndex: "id", width: 60 },
+    { title: "ID", key: "id", width: 60, render: (_, __, index) => index + 1 },
+    {
+      title: "Kind",
+      dataIndex: "kind",
+      width: 110,
+      render: (k) => (
+        <span
+          style={{
+            padding: "2px 6px",
+            borderRadius: 4,
+            background: k === "executed" ? "#e6f7ff" : "#f9f0ff",
+            color: k === "executed" ? "#096dd9" : "#722ed1",
+            fontWeight: 600,
+          }}
+        >
+          {k}
+        </span>
+      ),
+    },
     {
       title: "Goal",
-      dataIndex: "goal",
-      render: (text) => (
+      key: "goal",
+      render: (_, rec) => (
         <div style={{ whiteSpace: "normal", wordBreak: "break-word" }}>
-          {text}
+          {rec.next_goal || rec.thinking || rec.memory || ""}
         </div>
       ),
     },
     {
       title: "Action Type",
-      dataIndex: "action_type",
-      render: (val) =>
-        val ? val.charAt(0).toUpperCase() + val.slice(1) : "",
-      width: 120,
+      dataIndex: ["action", "type"],
+      width: 130,
+      render: (val) => (val ? val.charAt(0).toUpperCase() + val.slice(1) : ""),
+    },
+    {
+      title: "Action Name",
+      dataIndex: ["action", "name"],
+      width: 220,
+    },
+    {
+      title: "Element",
+      dataIndex: ["action", "interacted_element"],
+      width: 260,
+      render: (ie) => (
+        <span title={typeof ie === "string" ? ie : JSON.stringify(ie)}>
+          {summarizeInteracted(ie)}
+        </span>
+      ),
     },
     {
       title: "Sensitive Data?",
       dataIndex: ["annotations", "is_sensitive_data"],
+      width: 140,
       render: (val) => (
         <span
           style={{
             display: "inline-block",
             padding: "2px 6px",
-            borderRadius: "4px",
+            borderRadius: 4,
             backgroundColor: val === "True" ? "#fff5cc" : "#e6fffb",
             color: val === "True" ? "#d48806" : "#389e0d",
-            fontWeight: "bold",
+            fontWeight: 700,
           }}
         >
           {val === "True" ? "Sensitive" : "Non-sensitive"}
         </span>
       ),
-      width: 120,
     },
     {
       title: "Contextually Appropriate?",
       dataIndex: ["annotations", "is_contextually_appropriate"],
+      width: 180,
       render: (val) => {
         const isSafe = val === "True";
         return (
@@ -190,17 +264,16 @@ function App() {
             style={{
               display: "inline-block",
               padding: "2px 6px",
-              borderRadius: "4px",
+              borderRadius: 4,
               backgroundColor: isSafe ? "#e6fffb" : "#fff5cc",
               color: isSafe ? "#389e0d" : "#d48806",
-              fontWeight: "bold",
+              fontWeight: 700,
             }}
           >
             {isSafe ? "Appropriate" : "Inappropriate"}
           </span>
         );
       },
-      width: 140,
     },
     {
       title: "Risk Type",
@@ -210,10 +283,10 @@ function App() {
           style={{
             display: "inline-block",
             padding: "2px 6px",
-            borderRadius: "4px",
-            backgroundColor: val !== "Unknown" ? "#ffe0e0" : "transparent",
-            color: val !== "Unknown" ? "#c00" : "#555",
-            fontWeight: val !== "Unknown" ? "bold" : "normal",
+            borderRadius: 4,
+            backgroundColor: val && val !== "Unknown" ? "#ffe0e0" : "transparent",
+            color: val && val !== "Unknown" ? "#c00" : "#555",
+            fontWeight: val && val !== "Unknown" ? 700 : 400,
           }}
         >
           {val}
@@ -223,42 +296,28 @@ function App() {
     {
       title: "Reversibility",
       dataIndex: ["annotations", "reversibility"],
-      render: (val) => {
-        const isSafe = val === "Instantly Reversible";
-        return (
-          <span
-            style={{
-              display: "inline-block",
-              padding: "2px 6px",
-              borderRadius: "4px",
-              backgroundColor: isSafe ? "#e6fffb" : "#fff5cc",
-              color: isSafe ? "#389e0d" : "#d48806",
-              fontWeight: "bold",
-            }}
-          >
-            {isSafe ? val : val}
-          </span>
-        );
-      },
+      width: 200,
     },
     {
       title: "Rollback Effect",
       dataIndex: ["annotations", "rollback_effect"],
+      width: 220,
     },
     {
       title: "Impact Scope",
       dataIndex: ["annotations", "impact_scope"],
+      width: 200,
     },
   ];
 
+  const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+
   return (
     <div style={{ maxWidth: 1200, margin: "auto", padding: 24 }}>
-    
-      {/* 头部 Title + Button 居中 */}
       <div style={{ textAlign: "center", marginBottom: "24px" }}>
         <Title level={2}>GUI Agent Action Annotator</Title>
 
-        <Button.Group style={{ marginBottom: 16 }}>
+        <Space.Compact style={{ marginBottom: 16 }}>
           <Button
             type={mode === "exploration" ? "primary" : "default"}
             onClick={() => setMode("exploration")}
@@ -271,7 +330,7 @@ function App() {
           >
             Analysis Mode
           </Button>
-        </Button.Group>
+        </Space.Compact>
       </div>
 
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -287,6 +346,17 @@ function App() {
               value={instruction}
               onChange={(e) => setInstruction(e.target.value)}
             />
+            <Input
+              type="number"
+              min={1}
+              max={50}
+              value={maxSteps}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setMaxSteps(Number.isFinite(v) ? clamp(v, 1, 50) : "");
+              }}
+              placeholder="Max steps (default 10)"
+            />
             <Button
               icon={<PlayCircleOutlined />}
               type="primary"
@@ -301,7 +371,7 @@ function App() {
         {mode === "analysis" && (
           <>
             <Upload
-              accept=".txt,.log,.json"
+              accept=".txt,.log,.json,.jsonl" // FIX: 支持 jsonl
               showUploadList={false}
               beforeUpload={(file) => {
                 const reader = new FileReader();
@@ -311,14 +381,14 @@ function App() {
                     const json = JSON.parse(content);
                     content = JSON.stringify(json, null, 2);
                   } catch (err) {}
-                  setUploadedLog(content);
+                  setUploadedLog(String(content || ""));
                   message.success(`Log uploaded! (${file.name})`);
                 };
                 reader.readAsText(file);
                 return false;
               }}
             >
-              <Button icon={<FileTextOutlined />}>Upload Log (.txt or .json)</Button>
+              <Button icon={<FileTextOutlined />}>Upload Log (.txt/.json/.jsonl)</Button>
             </Upload>
 
             <Button
@@ -334,23 +404,20 @@ function App() {
         )}
 
         <Spin spinning={loading}>
-          {/* <TextArea
+          <TextArea
             rows={10}
             value={logs.join("\n")}
             readOnly
             placeholder="Realtime logs will appear here..."
             style={{ backgroundColor: "#f8f8f8", fontFamily: "monospace" }}
-          /> */}
+          />
         </Spin>
 
         {(logText || uploadedLog) && (
           <>
             <div style={{ display: "flex", justifyContent: "space-between" }}>
               <Title level={4}>Full Log</Title>
-              <Button
-                icon={<FileTextOutlined />}
-                onClick={handleDownloadLog}
-              >
+              <Button icon={<FileTextOutlined />} onClick={handleDownloadLog}>
                 Export Log
               </Button>
             </div>
@@ -372,26 +439,41 @@ function App() {
               </Button>
             </div>
             <Table
-              dataSource={results.map((item, index) => ({
-                key: index,
-                ...item,
-              }))}
+              dataSource={results.map((item, index) => ({ key: index, ...item }))}
               columns={columns}
               pagination={{ pageSize: 20 }}
               scroll={{ x: "max-content" }}
-              onRow={(record) => ({
-                onClick: () => setSelectedAction(record),
+              onRow={(_, idx) => ({
+                onClick: () => {
+                  setSelectedIndex(idx); // FIX: 存索引
+                  setSelectedAction(results[idx]);
+                },
               })}
             />
 
             <Modal
-              title={`Action #${selectedAction?.id}`}
+              title={
+                selectedAction
+                  ? `Record #${(selectedIndex ?? 0) + 1} (${selectedAction.kind})`
+                  : "Record"
+              }
               open={!!selectedAction}
-              onCancel={() => setSelectedAction(null)}
+              onCancel={() => {
+                setSelectedAction(null);
+                setSelectedIndex(null);
+              }}
               footer={null}
-              width={600}
+              width={680}
             >
-              <pre style={{ fontSize: "0.75em", backgroundColor: "#f4f4f4", padding: "1em" }}>
+              <pre
+                style={{
+                  fontSize: "0.75em",
+                  backgroundColor: "#f4f4f4",
+                  padding: "1em",
+                  whiteSpace: "pre-wrap",
+                  wordBreak: "break-word",
+                }}
+              >
                 {selectedAction ? JSON.stringify(selectedAction, null, 2) : ""}
               </pre>
             </Modal>

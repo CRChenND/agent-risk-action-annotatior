@@ -7,10 +7,12 @@ import asyncio
 import uuid
 import os
 import json
+from pathlib import Path
+import time
 
 from modules.run_agent_module import run_agent
-from modules.action_extractor_module import extract_actions
-from modules.action_annotator_module import annotate_actions
+from modules.action_extractor_module import parse_jsonl_to_combined
+from modules.action_annotator_module import annotate_pairs
 
 app = FastAPI()
 
@@ -23,7 +25,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Exploration Mode: run agent → extract → annotate
+# ---------- 小工具 ----------
+
+def _read_text(p: str | Path) -> str:
+    with open(p, "r", encoding="utf-8") as f:
+        return f.read()
+
+def _write_text(p: str | Path, s: str) -> str:
+    p = Path(p)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(s, encoding="utf-8")
+    return str(p)
+
+def _is_combined_records(obj) -> bool:
+    """
+    简单校验是否为 combined 结构（你现在的解析输出）：
+    - list of dict，且每条包含 kind/ts/url/action
+    """
+    if not isinstance(obj, list) or not obj:
+        return False
+    head = obj[0]
+    return (
+        isinstance(head, dict)
+        and "kind" in head
+        and "ts" in head
+        and "url" in head
+        and "action" in head
+    )
+
+# ---------- Exploration Mode: run agent → extract(combined) → annotate(pairs) ----------
+
 @app.websocket("/ws/agent")
 async def agent_endpoint(websocket: WebSocket):
     await websocket.accept()
@@ -31,45 +62,50 @@ async def agent_endpoint(websocket: WebSocket):
         data = await websocket.receive_json()
         url = data["url"]
         task = data["instruction"]
+        max_steps = data.get("max_steps", 10)
 
-        # session id = uuid + timestamp
         session_id = str(uuid.uuid4())[:8]
 
-        # Step 1: 日志回调
         async def send_log(line: str):
             await websocket.send_text(f"[log] {line}")
 
         await send_log(f"🧠 Running agent on {url} (Session {session_id})...")
 
-        # Step 2: run agent
-        log_path = await run_agent(url, task, log_callback=send_log)
+        # Step 1: run agent -> 返回 JSONL 路径
+        # 你的 run_agent 接口如果是 (task, url, max_steps) 记得按你的实现调整
+        log_path = await run_agent(
+            task=task,
+            url=url,
+            max_steps=max_steps,
+            log_callback=send_log,  # 可选：若你的 run_agent 支持
+        )
         await send_log(f"✅ Agent finished. Log saved at {log_path}")
 
-        # Step 3: send log content
-        with open(log_path, "r") as f:
-            log_content = f.read()
-
+        # 把日志全文发给前端展示
+        log_text = await asyncio.to_thread(_read_text, log_path)
         await websocket.send_json({
             "type": "agent_log_text",
-            "log_text": log_content,
+            "log_text": log_text,
             "log_path": log_path,
             "session_id": session_id
         })
 
-        # Step 4: extract actions
-        await send_log("🔍 Extracting actions from log...")
-        extracted = extract_actions(log_content)
-        await send_log(f"✅ Extracted {len(extracted)} actions.")
+        # Step 2: extract → combined（仅输出 combined）
+        await send_log("🔍 Extracting combined actions from JSONL log...")
+        combined_path = await asyncio.to_thread(parse_jsonl_to_combined, log_path, None)
+        combined = json.loads(await asyncio.to_thread(_read_text, combined_path))
+        await send_log(f"✅ Combined parsed: {len(combined)} records. ({combined_path})")
 
-        # Step 5: annotate actions
-        await send_log("🧪 Annotating actions with LLM...")
-        annotated = annotate_actions(extracted)
-        await send_log(f"✅ Annotated {len(annotated)} actions.")
+        # Step 3: annotate → 按 planned↔executed pair
+        await send_log("🧪 Annotating planned↔executed pairs with LLM...")
+        annotated_combined = await asyncio.to_thread(annotate_pairs, combined)
+        await send_log(f"✅ Annotated {len(annotated_combined)} records.")
 
-        # Final result
+        # 最终结果
         await websocket.send_json({
             "type": "final_result",
-            "annotated_actions": annotated,
+            "annotated_combined": annotated_combined,
+            "combined_path": combined_path,
             "session_id": session_id
         })
 
@@ -81,14 +117,14 @@ async def agent_endpoint(websocket: WebSocket):
             "message": str(e)
         })
 
-# Analysis Mode: upload log → extract → annotate
+# ---------- Analysis Mode: upload JSONL(text) → extract(combined) → annotate(pairs) ----------
+
 @app.websocket("/ws/analyze")
 async def analyze_endpoint(websocket: WebSocket):
     await websocket.accept()
     try:
         data = await websocket.receive_json()
         log_text = data["log_text"]
-
         session_id = str(uuid.uuid4())[:8]
 
         async def send_log(line: str):
@@ -96,43 +132,36 @@ async def analyze_endpoint(websocket: WebSocket):
 
         await send_log(f"🔍 Analyzing uploaded log (Session {session_id})...")
 
-        # Step 1: try to parse as JSON first
+        # 1) 用户可能直接上传的是 combined JSON（而不是 JSONL）
         try:
-            parsed = json.loads(log_text)
-
-            def is_valid_action(item):
-                return (
-                    isinstance(item, dict)
-                    and "id" in item
-                    and "goal" in item
-                    and "action_type" in item
-                    and "action_detail" in item
-                )
-
-            if isinstance(parsed, list) and all(is_valid_action(item) for item in parsed):
-                await send_log("📄 Detected uploaded JSON is a valid action list — skipping extraction.")
-                extracted = parsed
+            parsed_json = json.loads(log_text)
+            if _is_combined_records(parsed_json):
+                await send_log("📄 Detected uploaded JSON is combined records — skipping extraction.")
+                combined = parsed_json
             else:
-                # Fallback: treat as raw log
-                await send_log("🔍 Uploaded JSON is not a valid action list — extracting actions...")
-                extracted = extract_actions(log_text)
-                await send_log(f"✅ Extracted {len(extracted)} actions.")
+                # 不是 combined，就按 JSONL 处理
+                raise ValueError("Not combined JSON. Fallthrough to JSONL.")
+        except Exception:
+            # 2) 当作 JSONL：先落盘，再解析
+            await send_log("📄 Treating upload as JSONL. Parsing to combined...")
+            tmp_dir = Path("uploads")
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            tmp_jsonl = tmp_dir / f"uploaded_{session_id}.jsonl"
+            await asyncio.to_thread(_write_text, tmp_jsonl, log_text)
 
-        except json.JSONDecodeError:
-            # Not JSON, treat as raw log
-            await send_log("🔍 Detected raw log — extracting actions...")
-            extracted = extract_actions(log_text)
-            await send_log(f"✅ Extracted {len(extracted)} actions.")
+            combined_path = await asyncio.to_thread(parse_jsonl_to_combined, str(tmp_jsonl), None)
+            combined = json.loads(await asyncio.to_thread(_read_text, combined_path))
+            await send_log(f"✅ Combined parsed: {len(combined)} records. ({combined_path})")
 
-        # Step 2: annotate
-        await send_log("🧪 Annotating actions with LLM...")
-        annotated = annotate_actions(extracted)
-        await send_log(f"✅ Annotated {len(annotated)} actions.")
+        # 3) annotate pairs
+        await send_log("🧪 Annotating planned↔executed pairs with LLM...")
+        annotated_combined = await asyncio.to_thread(annotate_pairs, combined)
+        await send_log(f"✅ Annotated {len(annotated_combined)} records.")
 
-        # Final result
+        # 输出
         await websocket.send_json({
             "type": "final_result",
-            "annotated_actions": annotated,
+            "annotated_combined": annotated_combined,
             "session_id": session_id
         })
 
@@ -145,24 +174,24 @@ async def analyze_endpoint(websocket: WebSocket):
         })
 
 
-# Download endpoint (optional, for saving)
+# ---------- Download endpoint ----------
+
 @app.post("/download")
 async def download(request: Request):
     try:
         data = await request.json()
-        annotated_actions = data.get("annotated_actions", [])
+        annotated_combined = data.get("annotated_combined", [])
         session_id = data.get("session_id", str(uuid.uuid4())[:8])
 
         os.makedirs("downloads", exist_ok=True)
         output_path = os.path.join("downloads", f"annotated_{session_id}.json")
-
-        with open(output_path, "w") as f:
-            json.dump(annotated_actions, f, indent=2)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(annotated_combined, f, ensure_ascii=False, indent=2)
 
         return JSONResponse({
             "status": "ok",
             "path": output_path,
-            "count": len(annotated_actions)
+            "count": len(annotated_combined)
         })
 
     except Exception as e:
