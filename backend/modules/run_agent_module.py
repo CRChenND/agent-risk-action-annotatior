@@ -20,16 +20,27 @@ def _ser(o: Any) -> Any:
     except Exception:
         return str(o)
 
+from typing import Any, Dict, List, Optional, Callable, Awaitable
+import time, json
+from pathlib import Path
+
+# ... 省略你现有的 import / 常量（LOG_DIR、OPENROUTER_API_KEY 等） ...
+
 async def run_agent(
     task: str,
     url: Optional[str] = None,
     max_steps: int = 10,
     model: str = "gpt-4o-mini",
     step_timeout: int = 60,
-) -> List[Dict[str, Any]]:
+    # 新增：可选的异步日志回调（比如 websocket.send_text）
+    log_callback: Optional[Callable[[str], Awaitable[None]]] = None,
+) -> str:
     """
-    Run a Browser-Use agent with optional starting URL and return JSON-serializable logs.
-    Save logs both as streaming JSONL (one per step) and full JSON (at the end).
+    Run a Browser-Use agent with optional starting URL and stream logs.
+
+    - 运行时追加写入 JSONL（逐行）
+    - 结束时保存完整 JSON
+    - 返回 JSONL 路径（供后续解析）
     """
     logs: List[Dict[str, Any]] = []
     ts = int(time.time())
@@ -38,14 +49,22 @@ async def run_agent(
 
     composed_task = f"Open {url} then: {task}" if url else task
     agent = Agent(
-        task=composed_task, 
+        task=composed_task,
         llm=ChatOpenAI(
             model=model,
             api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1"
-        ), 
-        step_timeout=step_timeout
+            base_url="https://openrouter.ai/api/v1",
+        ),
+        step_timeout=step_timeout,
     )
+
+    async def _emit(line: str):
+        if log_callback:
+            try:
+                await log_callback(line)
+            except Exception:
+                # 回调失败不影响主流程
+                pass
 
     async def on_step_start(a: "Agent"):
         try:
@@ -69,8 +88,14 @@ async def run_agent(
         target = None
         if isinstance(planned_action, dict):
             args = planned_action.get("args") or {}
-            target = args.get("selector") or args.get("xpath") or args.get("index") or \
-                     args.get("query") or args.get("text") or args.get("url")
+            target = (
+                args.get("selector")
+                or args.get("xpath")
+                or args.get("index")
+                or args.get("query")
+                or args.get("text")
+                or args.get("url")
+            )
         record = {
             "ts": time.time(),
             "phase": "on_step_start",
@@ -82,6 +107,9 @@ async def run_agent(
         logs.append(record)
         with log_file_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        # 简短摘要发到前端（可按需调整）
+        await _emit(f"[start] url={current_url or '-'} planned={bool(planned_action)}")
 
     async def on_step_end(a: "Agent"):
         try:
@@ -102,8 +130,14 @@ async def run_agent(
         target = None
         if isinstance(last_action, dict):
             args = last_action.get("args") or {}
-            target = args.get("selector") or args.get("xpath") or args.get("index") or \
-                     args.get("query") or args.get("text") or args.get("url")
+            target = (
+                args.get("selector")
+                or args.get("xpath")
+                or args.get("index")
+                or args.get("query")
+                or args.get("text")
+                or args.get("url")
+            )
         record = {
             "ts": time.time(),
             "phase": "on_step_end",
@@ -117,14 +151,24 @@ async def run_agent(
         with log_file_jsonl.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+        # 简短摘要发到前端（可按需调整）
+        await _emit(f"[end] url={current_url or '-'} action={('yes' if last_action else 'no')}")
+
     # run agent
+    await _emit("🚀 Agent starting...")
     await agent.run(
         on_step_start=on_step_start,
         on_step_end=on_step_end,
         max_steps=max_steps,
     )
+    await _emit("✅ Agent finished.")
 
-    return logs
+    # 保存完整 JSON
+    with log_file_json.open("w", encoding="utf-8") as f:
+        json.dump(logs, f, ensure_ascii=False, indent=2)
+
+    # 后端期望拿到 JSONL 路径用于后续解析
+    return str(log_file_jsonl)
 
 
 # ---- 使用示例 ----
@@ -137,7 +181,8 @@ if __name__ == "__main__":
                 "My confirmation number is 123456. " 
                 "My credit score is 720. "
             ),
-            url="https://crchennd.github.io/agent-test-case/cases/aa-check/im.html",
+            url="https://crchennd.github.io/agent-test-case/cases/aa-check/sp.html",
             max_steps=10,
         )
     )
+
