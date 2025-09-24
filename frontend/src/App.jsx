@@ -185,7 +185,7 @@ function App() {
   };
 
   const columns = [
-    { title: "ID", key: "id", width: 60, render: (_, __, index) => index + 1 },
+    { title: "ID", key: "id", width: 30, render: (_, __, index) => index + 1 },
     {
       title: "Kind",
       dataIndex: "kind",
@@ -207,6 +207,7 @@ function App() {
     {
       title: "Goal",
       key: "goal",
+      width: 220,
       render: (_, rec) => (
         <div style={{ whiteSpace: "normal", wordBreak: "break-word" }}>
           {rec.next_goal || rec.thinking || rec.memory || ""}
@@ -216,28 +217,13 @@ function App() {
     {
       title: "Action Type",
       dataIndex: ["action", "type"],
-      width: 130,
+      width: 100,
       render: (val) => (val ? val.charAt(0).toUpperCase() + val.slice(1) : ""),
-    },
-    {
-      title: "Action Name",
-      dataIndex: ["action", "name"],
-      width: 220,
-    },
-    {
-      title: "Element",
-      dataIndex: ["action", "interacted_element"],
-      width: 260,
-      render: (ie) => (
-        <span title={typeof ie === "string" ? ie : JSON.stringify(ie)}>
-          {summarizeInteracted(ie)}
-        </span>
-      ),
     },
     {
       title: "Sensitive Data?",
       dataIndex: ["annotations", "is_sensitive_data"],
-      width: 140,
+      width: 100,
       render: (val) => (
         <span
           style={{
@@ -256,7 +242,7 @@ function App() {
     {
       title: "Contextually Appropriate?",
       dataIndex: ["annotations", "is_contextually_appropriate"],
-      width: 180,
+      width: 100,
       render: (val) => {
         const isSafe = val === "True";
         return (
@@ -278,6 +264,7 @@ function App() {
     {
       title: "Risk Type",
       dataIndex: ["annotations", "risk_type"],
+      width: 100,
       render: (val) => (
         <span
           style={{
@@ -296,17 +283,17 @@ function App() {
     {
       title: "Reversibility",
       dataIndex: ["annotations", "reversibility"],
-      width: 200,
+      width: 100,
     },
     {
       title: "Rollback Effect",
       dataIndex: ["annotations", "rollback_effect"],
-      width: 220,
+      width: 120,
     },
     {
       title: "Impact Scope",
       dataIndex: ["annotations", "impact_scope"],
-      width: 200,
+      width: 100,
     },
   ];
 
@@ -412,23 +399,6 @@ function App() {
             style={{ backgroundColor: "#f8f8f8", fontFamily: "monospace" }}
           />
         </Spin>
-
-        {(logText || uploadedLog) && (
-          <>
-            <div style={{ display: "flex", justifyContent: "space-between" }}>
-              <Title level={4}>Full Log</Title>
-              <Button icon={<FileTextOutlined />} onClick={handleDownloadLog}>
-                Export Log
-              </Button>
-            </div>
-            <TextArea
-              rows={10}
-              value={mode === "exploration" ? logText : uploadedLog}
-              readOnly
-              style={{ backgroundColor: "#f4f4f4", fontFamily: "monospace" }}
-            />
-          </>
-        )}
 
         {results && (
           <>
