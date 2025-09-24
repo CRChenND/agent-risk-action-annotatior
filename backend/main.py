@@ -3,6 +3,7 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 import asyncio
 import uuid
 import os
@@ -102,12 +103,13 @@ async def agent_endpoint(websocket: WebSocket):
         await send_log(f"✅ Annotated {len(annotated_combined)} records.")
 
         # 最终结果
-        await websocket.send_json({
+        payload = {
             "type": "final_result",
             "annotated_combined": annotated_combined,
-            "combined_path": combined_path,
-            "session_id": session_id
-        })
+            "combined_path": combined_path,  # 可以是 Path
+            "session_id": session_id,
+        }
+        await websocket.send_json(jsonable_encoder(payload))
 
     except WebSocketDisconnect:
         print("🚫 WebSocket disconnected.")
